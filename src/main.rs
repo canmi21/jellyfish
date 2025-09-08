@@ -2,6 +2,7 @@
 
 mod config;
 mod handler;
+mod response;
 mod server;
 mod shutdown;
 
