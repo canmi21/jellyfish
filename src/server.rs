@@ -1,34 +1,70 @@
 /* src/server.rs */
 
+use crate::config::Config;
 use crate::handler::fallback_handler;
-use axum::{Router, routing::get_service};
+use axum::handler::Handler;
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    http::Request,
+    response::IntoResponse,
+    routing::{get, get_service},
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
-pub fn create_router(public_dir: PathBuf) -> Router {
-    let shared_public_dir = Arc::new(public_dir.clone());
+// Define a struct to hold all shared state.
+#[derive(Clone)]
+pub struct AppState {
+    pub public_dir: PathBuf,
+    pub index_router_mode: bool,
+}
 
-    // 1. Create a dedicated router FOR the fallback logic.
-    // This router's only job is to host our handler. Because a Router
-    // implements the `Service` trait, it can be used by `ServeDir`.
-    let fallback_service = Router::new()
-        .fallback(fallback_handler)
-        // Provide the necessary state to the handler within this fallback router.
-        .with_state(shared_public_dir);
+// This is a new, specific handler for the root path ("/").
+// Its purpose is to intercept the request for "/" before `ServeDir` can process it.
+// This ensures the root path always respects the logic in `fallback_handler`
+// (like checking for SPA mode) instead of just serving `index.html` by default.
+async fn root_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> impl IntoResponse {
+    // This handler simply calls the main fallback_handler.
+    // This ensures consistent logic for both the root path and any other "not found" paths.
+    fallback_handler(State(state), req).await
+}
 
-    // 2. Configure the main static file service.
-    // When ServeDir can't find a file, it will forward the request
-    // to the `fallback_service` we just created.
-    let serve_dir_service = ServeDir::new(public_dir).fallback(fallback_service);
+pub fn create_router(config: Config) -> Router {
+    // Create an instance of our shared state.
+    let app_state = Arc::new(AppState {
+        public_dir: config.public_dir.clone(),
+        index_router_mode: config.index_router_mode,
+    });
 
-    // 3. The main application router delegates ALL requests to our composite service.
-    Router::new().fallback_service(get_service(serve_dir_service).handle_error(
-        |error| async move {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Static file service error: {}", error),
-            )
-        },
-    ))
+    // --- ROUTING LOGIC CHANGE ---
+
+    // 1. Create the static file service (ServeDir).
+    // We attach our main fallback_handler as the fallback for ServeDir itself.
+    // This means: if ServeDir cannot find a requested file (e.g., "/non-existent.css"),
+    // it will then call our custom fallback_handler.
+    let serve_dir_with_fallback =
+        ServeDir::new(config.public_dir).fallback(fallback_handler.with_state(app_state.clone()));
+
+    // 2. Build the main application router with the corrected logic.
+    Router::new()
+        // 2A. Define an explicit route for "GET /".
+        // Routes are checked *before* fallback services. By defining this route,
+        // we guarantee that requests for the root path are handled by our `root_handler`,
+        // which then uses our custom SPA/404 logic.
+        .route("/", get(root_handler))
+        // 2B. For any request that does *not* match a route above (e.g., "/style.css" or "/some/route"),
+        // pass it to our `serve_dir_with_fallback` service.
+        .fallback_service(
+            get_service(serve_dir_with_fallback).handle_error(|error| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Static file service error: {}", error),
+                )
+            }),
+        )
+        // Provide the AppState to the router so our handlers can access it.
+        .with_state(app_state)
 }
