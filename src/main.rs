@@ -1,25 +1,41 @@
 /* src/main.rs */
 
-use dotenvy::dotenv;
-use fancy_log::{LogLevel, log, set_log_level};
+mod config;
+mod handler;
+mod server;
+mod shutdown;
+
+use crate::config::{Config, setup_public_dir};
+use fancy_log::{LogLevel, log};
 use lazy_motd::lazy_motd;
-use std::env;
+use tokio::net::TcpListener;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     // --- Initialization ---
-    dotenv().ok();
-    let level = env::var("LOG_LEVEL")
-        .unwrap_or_else(|_| "info".to_string())
-        .to_lowercase();
-    let log_level = match level.as_str() {
-        "debug" => LogLevel::Debug,
-        "warn" => LogLevel::Warn,
-        "error" => LogLevel::Error,
-        _ => LogLevel::Info,
-    };
-    set_log_level(log_level);
-    lazy_motd!();
+    let config = Config::from_env()?;
+
+    lazy_motd!(bin = "jellyfish");
+    log(LogLevel::Info, "Jellyfish server starting...");
+    log(
+        LogLevel::Info,
+        &format!("Serving files from: {}", config.public_dir.display()),
+    );
+    log(
+        LogLevel::Info,
+        &format!("Listening on: http://{}", config.addr),
+    );
+
+    // Check and create public directory if it doesn't exist
+    setup_public_dir(&config.public_dir)?;
+
+    // --- Create and run server ---
+    let app = server::create_router(config.public_dir);
+    let listener = TcpListener::bind(&config.addr).await?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown::signal_handler())
+        .await?;
 
     Ok(())
 }
