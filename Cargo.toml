@@ -20,7 +20,7 @@ tower-http = { version = "0.5", features = ["fs"] }
 dotenvy = "0.15"
 fancy-log = "0.1"
 shellexpand = "3"
-anyhow = "1.0"
+anyhow = "1"
 lazy-motd = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 chrono = "0.4"
