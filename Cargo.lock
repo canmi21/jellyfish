@@ -460,6 +460,7 @@ dependencies = [
  "dotenvy",
  "fancy-log",
  "lazy-motd",
+ "mime_guess",
  "path-clean",
  "percent-encoding",
  "serde",
