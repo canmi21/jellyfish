@@ -5,10 +5,12 @@ use crate::server::AppState;
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use fancy_log::{LogLevel, log};
+use mime_guess;
 use path_clean::PathClean;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
@@ -41,8 +43,13 @@ pub async fn main_handler(
     req: Request<Body>,
 ) -> Response {
     // --- 1. Decode and Sanitize Path ---
-    let requested_path_str = req.uri().path();
-    let decoded_path = percent_encoding::percent_decode_str(requested_path_str)
+    let requested_path_str = req.uri().path().to_string(); // Keep a copy for logging
+    log(
+        LogLevel::Debug,
+        &format!("-> New request for URI: {}", requested_path_str),
+    );
+
+    let decoded_path = percent_encoding::percent_decode_str(&requested_path_str)
         .decode_utf8_lossy()
         .to_string();
     let path = PathBuf::from(decoded_path);
@@ -50,15 +57,24 @@ pub async fn main_handler(
     let clean_path = path.clean();
     for component in clean_path.components() {
         if let Component::ParentDir = component {
+            log(
+                LogLevel::Debug,
+                "   Path traversal detected. Responding with 403 FORBIDDEN.",
+            );
             return error(StatusCode::FORBIDDEN, "Path traversal is not allowed.");
         }
     }
     let safe_relative_path = clean_path.strip_prefix("/").unwrap_or(&clean_path);
     let resource_path = state.public_dir.join(safe_relative_path);
+    log(
+        LogLevel::Debug,
+        &format!("   Sanitized resource path: {}", resource_path.display()),
+    );
 
     // --- 2. Handle API calls ONLY when NOT in SPA mode ---
     if !state.index_router_mode {
         if params.info.is_some() {
+            log(LogLevel::Debug, "   API call detected: ?info. Handling...");
             return api_get_file_info(
                 &resource_path,
                 safe_relative_path.to_string_lossy().as_ref(),
@@ -66,18 +82,54 @@ pub async fn main_handler(
             .await;
         }
         if params.list.is_some() {
+            log(LogLevel::Debug, "   API call detected: ?list. Handling...");
             return api_list_directory(&resource_path).await;
         }
     }
 
     // --- 3. Attempt to serve a static file ---
-    // This runs for BOTH modes.
+    log(
+        LogLevel::Debug,
+        "   Attempting to serve static file via ServeDir...",
+    );
     match ServeDir::new(&state.public_dir).oneshot(req).await {
         Ok(res) => {
-            // If the file is not found by ServeDir, THEN we decide the fallback strategy.
+            log(
+                LogLevel::Debug,
+                &format!("   ServeDir response status: {}", res.status()),
+            );
+
             if res.status() == StatusCode::NOT_FOUND {
-                // --- 4a. SPA Fallback (INDEX_ROUTER_MODE=true) ---
+                // --- FIX: WORKAROUND for files with unknown MIME types ---
+                log(
+                    LogLevel::Debug,
+                    "   ServeDir returned 404. Manually checking if file exists...",
+                );
+                if resource_path.is_file() {
+                    log(
+                        LogLevel::Debug,
+                        &format!(
+                            "   Manual check FOUND file at {}. Serving with guessed MIME type.",
+                            resource_path.display()
+                        ),
+                    );
+                    if let Ok(content) = tokio::fs::read(&resource_path).await {
+                        let mime_type =
+                            mime_guess::from_path(&resource_path).first_or_octet_stream();
+                        let mut headers = HeaderMap::new();
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_str(mime_type.as_ref()).unwrap(),
+                        );
+                        return (headers, content).into_response();
+                    }
+                } else {
+                    log(LogLevel::Debug, "   Manual check did NOT find file.");
+                }
+
+                // --- Fallback Logic ---
                 if state.index_router_mode {
+                    log(LogLevel::Debug, "   Entering SPA fallback logic...");
                     let index_path = state.public_dir.join("index.html");
                     if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
                         return (StatusCode::OK, Html(content)).into_response();
@@ -87,22 +139,26 @@ pub async fn main_handler(
                             "SPA mode is on, but index.html could not be found.",
                         );
                     }
-                }
-                // --- 4b. Standard 404 Fallback (INDEX_ROUTER_MODE=false) ---
-                else {
+                } else {
+                    log(
+                        LogLevel::Debug,
+                        "   Entering standard 404 fallback logic...",
+                    );
                     let custom_404_path = state.public_dir.join("404.html");
                     if let Ok(content) = tokio::fs::read_to_string(custom_404_path).await {
                         return (StatusCode::NOT_FOUND, Html(content)).into_response();
                     }
-                    // Fallback to the hardcoded 404 if a custom one doesn't exist
                     let static_404_content = include_str!("../index/404.html");
                     return (StatusCode::NOT_FOUND, Html(static_404_content)).into_response();
                 }
             }
-            // Otherwise, the file was found or a different error occurred. Return the response.
             return res.into_response();
         }
         Err(e) => {
+            log(
+                LogLevel::Error,
+                &format!("   Static file service internal error: {}", e),
+            );
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Static file service error: {}", e),
@@ -112,7 +168,7 @@ pub async fn main_handler(
 }
 
 // (The two API helper functions below are unchanged)
-
+// ... (rest of the file is the same)
 /// API logic to get information about a single file.
 async fn api_get_file_info(path: &Path, relative_path: &str) -> Response {
     match tokio::fs::metadata(path).await {
