@@ -10,7 +10,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use path_clean::PathClean;
-use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
@@ -43,7 +42,7 @@ pub async fn main_handler(
 ) -> Response {
     // --- 1. Decode and Sanitize Path ---
     let requested_path_str = req.uri().path();
-    let decoded_path = percent_decode_str(requested_path_str)
+    let decoded_path = percent_encoding::percent_decode_str(requested_path_str)
         .decode_utf8_lossy()
         .to_string();
     let path = PathBuf::from(decoded_path);
@@ -57,24 +56,27 @@ pub async fn main_handler(
     let safe_relative_path = clean_path.strip_prefix("/").unwrap_or(&clean_path);
     let resource_path = state.public_dir.join(safe_relative_path);
 
-    // --- 2. Handle API calls FIRST ---
-    if params.info.is_some() {
-        return api_get_file_info(
-            &resource_path,
-            safe_relative_path.to_string_lossy().as_ref(),
-        )
-        .await;
-    }
-    if params.list.is_some() {
-        return api_list_directory(&resource_path).await;
+    // --- 2. Handle API calls ONLY when NOT in SPA mode ---
+    if !state.index_router_mode {
+        if params.info.is_some() {
+            return api_get_file_info(
+                &resource_path,
+                safe_relative_path.to_string_lossy().as_ref(),
+            )
+            .await;
+        }
+        if params.list.is_some() {
+            return api_list_directory(&resource_path).await;
+        }
     }
 
     // --- 3. Attempt to serve a static file ---
+    // This runs for BOTH modes.
     match ServeDir::new(&state.public_dir).oneshot(req).await {
         Ok(res) => {
-            // If the file is not found, THEN we consider fallbacks.
+            // If the file is not found by ServeDir, THEN we decide the fallback strategy.
             if res.status() == StatusCode::NOT_FOUND {
-                // --- 4a. SPA Fallback ---
+                // --- 4a. SPA Fallback (INDEX_ROUTER_MODE=true) ---
                 if state.index_router_mode {
                     let index_path = state.public_dir.join("index.html");
                     if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
@@ -86,17 +88,18 @@ pub async fn main_handler(
                         );
                     }
                 }
-                // --- 4b. Standard 404 Fallback ---
+                // --- 4b. Standard 404 Fallback (INDEX_ROUTER_MODE=false) ---
                 else {
                     let custom_404_path = state.public_dir.join("404.html");
                     if let Ok(content) = tokio::fs::read_to_string(custom_404_path).await {
                         return (StatusCode::NOT_FOUND, Html(content)).into_response();
                     }
+                    // Fallback to the hardcoded 404 if a custom one doesn't exist
                     let static_404_content = include_str!("../index/404.html");
                     return (StatusCode::NOT_FOUND, Html(static_404_content)).into_response();
                 }
             }
-            // Otherwise, the file was found or another error occurred, return the response.
+            // Otherwise, the file was found or a different error occurred. Return the response.
             return res.into_response();
         }
         Err(e) => {
