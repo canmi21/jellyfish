@@ -41,28 +41,13 @@ pub async fn main_handler(
     Query(params): Query<ApiParams>,
     req: Request<Body>,
 ) -> Response {
-    // --- 1. Handle SPA Mode ---
-    if state.index_router_mode {
-        let index_path = state.public_dir.join("index.html");
-        if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
-            return (StatusCode::OK, Html(content)).into_response();
-        } else {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SPA mode is on, but index.html could not be found.",
-            );
-        }
-    }
-
-    // --- NON-SPA MODE LOGIC from here ---
-
+    // --- 1. Decode and Sanitize Path ---
     let requested_path_str = req.uri().path();
     let decoded_path = percent_decode_str(requested_path_str)
         .decode_utf8_lossy()
         .to_string();
     let path = PathBuf::from(decoded_path);
 
-    // --- 2. Security Check ---
     let clean_path = path.clean();
     for component in clean_path.components() {
         if let Component::ParentDir = component {
@@ -72,7 +57,7 @@ pub async fn main_handler(
     let safe_relative_path = clean_path.strip_prefix("/").unwrap_or(&clean_path);
     let resource_path = state.public_dir.join(safe_relative_path);
 
-    // --- 3. API Check ---
+    // --- 2. Handle API calls FIRST ---
     if params.info.is_some() {
         return api_get_file_info(
             &resource_path,
@@ -84,12 +69,35 @@ pub async fn main_handler(
         return api_list_directory(&resource_path).await;
     }
 
-    // --- 4. Static File Serving ---
+    // --- 3. Attempt to serve a static file ---
     match ServeDir::new(&state.public_dir).oneshot(req).await {
         Ok(res) => {
-            if res.status() != StatusCode::NOT_FOUND {
-                return res.into_response();
+            // If the file is not found, THEN we consider fallbacks.
+            if res.status() == StatusCode::NOT_FOUND {
+                // --- 4a. SPA Fallback ---
+                if state.index_router_mode {
+                    let index_path = state.public_dir.join("index.html");
+                    if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
+                        return (StatusCode::OK, Html(content)).into_response();
+                    } else {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "SPA mode is on, but index.html could not be found.",
+                        );
+                    }
+                }
+                // --- 4b. Standard 404 Fallback ---
+                else {
+                    let custom_404_path = state.public_dir.join("404.html");
+                    if let Ok(content) = tokio::fs::read_to_string(custom_404_path).await {
+                        return (StatusCode::NOT_FOUND, Html(content)).into_response();
+                    }
+                    let static_404_content = include_str!("../index/404.html");
+                    return (StatusCode::NOT_FOUND, Html(static_404_content)).into_response();
+                }
             }
+            // Otherwise, the file was found or another error occurred, return the response.
+            return res.into_response();
         }
         Err(e) => {
             return error(
@@ -98,15 +106,6 @@ pub async fn main_handler(
             );
         }
     };
-
-    // --- 5. Custom 404 Fallback ---
-    let custom_404_path = state.public_dir.join("404.html");
-    if let Ok(content) = tokio::fs::read_to_string(custom_404_path).await {
-        return (StatusCode::NOT_FOUND, Html(content)).into_response();
-    }
-
-    let static_404_content = include_str!("../index/404.html");
-    (StatusCode::NOT_FOUND, Html(static_404_content)).into_response()
 }
 
 // (The two API helper functions below are unchanged)
